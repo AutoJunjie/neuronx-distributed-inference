@@ -17,6 +17,7 @@ These are the workflows that produced the `contrib/models/gemma-4-12B-it` port.
 | `nxdi-onboard-diffusion.js` | Diffusion-model counterpart (e.g. Qwen-Image-Edit / FireRed-Image-Edit): profile `model_index` + transformer config, classify adaptability vs a base contrib port, materialize + repath contrib code, compile the components, then run a real image edit and validate the output. |
 | `gemma4-fix-verify.js` | Focused fix → verify → repair workflow used to bring the generated Gemma-4 text-decoder modeling file to numerical correctness on Neuron via `inference_demo` (TP=8). Seeded with grounded findings (proportional RoPE, `attention_k_eq_v`, per-layer-head_dim KV cache, `softmax_scale`, `layer_scalar`, …) so agents apply known fixes instead of rediscovering them. A worked example of the repair pattern. |
 | `nxdi-onboarding-kb.md` | The verified knowledge base the workflows read each run: NxDI base-class contracts, verified vs. unverified import paths, sharding rules, weight-converter conventions, and common onboarding bugs. |
+| `ONBOARDING_RETROSPECTIVE.md` | Candid write-up of the gemma-4-12B-it & FireRed-Image-Edit onboardings: full process, the bugs that actually mattered, exact token/time cost, and where the workflow did not help (the gaps that motivated the P0/P1 hardening). |
 
 ## Usage
 
