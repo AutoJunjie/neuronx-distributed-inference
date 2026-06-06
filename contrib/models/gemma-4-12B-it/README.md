@@ -67,6 +67,14 @@ For the raw prompt `"The capital of France is"` (input_ids `[818, 5279, 529, 700
 Verified through **both** the native `inference_demo` engine and the
 **vLLM-on-Neuron OpenAI server** (`/v1/chat/completions`).
 
+## Tutorial notebook
+
+For a guided, end-to-end walkthrough — profile the arch → download + flatten the
+text-decoder config → build a golden CPU reference → compile (TP=8) → **verify
+numerical parity vs. golden** → chat (Paris / 408) → serve via vLLM — open
+[`gemma4_neuron_tutorial.ipynb`](gemma4_neuron_tutorial.ipynb) with the Neuron venv
+kernel and run it top to bottom. Regenerate it with `python build_nb.py` (needs `nbformat`).
+
 ## Usage
 
 ```python
