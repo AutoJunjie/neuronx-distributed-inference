@@ -1,17 +1,18 @@
 export const meta = {
   name: 'nxdi-onboard-model',
-  description: 'Onboard a model to run on NxD Inference: profile the architecture, ground against the verified KB + reference code, scaffold modeling_<model>.py (config/model/task-head/weight-converter), adversarially review, emit a tailored plan + runbook, then ACTUALLY VERIFY on hardware (download weights, load the generated file into vLLM, compile, chat) with an automatic source-grounded repair loop.',
-  whenToUse: 'When you want to port a HuggingFace model to AWS NxD Inference (Trn1/Trn2/Inf2). Pass the HF model id as args (e.g. "Qwen/Qwen3-30B-A3B"), or an object {model, config_url, instance, tp_degree, fused_qkv, notes, verify, max_repair_rounds}. Set verify:false to skip the on-hardware verify+repair phases (e.g. no Neuron device). Omit args for a generic Llama-reference playbook + scaffold.',
+  description: 'Onboard a model to run on NxD Inference: profile the architecture, ground against the verified KB + reference code, scaffold modeling_<model>.py (config/model/task-head/weight-converter), adversarially review, emit a tailored plan + runbook, then ACTUALLY VERIFY on hardware (download weights, build a golden CPU reference, load the generated file into an engine, compile, and check NUMERICAL CORRECTNESS — not just "it runs") with an automatic source-grounded repair loop.',
+  whenToUse: 'When you want to port a HuggingFace model to AWS NxD Inference (Trn1/Trn2/Inf2). Pass the HF model id as args (e.g. "Qwen/Qwen3-30B-A3B"), or an object {model, config_url, instance, tp_degree, fused_qkv, notes, verify, require_verify, golden_ref, max_repair_rounds}. verify:false skips the on-hardware phases. require_verify:true makes the whole run FAIL (not silently succeed) if hardware verification could not run or did not reach numerical correctness. golden_ref:false skips building the CPU reference. Omit args for a generic Llama-reference playbook + scaffold.',
   phases: [
-    { title: 'Setup', detail: 'resolve portable absolute paths ($HOME, KB location, output dir) + detect Neuron device / vLLM venv for this machine' },
-    { title: 'Profile', detail: 'read the HF config to classify the architecture (dense vs MoE, dims, quirks)' },
-    { title: 'Ground', detail: 'read the verified KB + reference modeling files; resolve UNVERIFIED import paths' },
+    { title: 'Setup', detail: 'resolve portable absolute paths ($HOME, KB location, output dir) + DETERMINISTICALLY detect Neuron device / engine venv for this machine (fail-loud if require_verify)' },
+    { title: 'Profile', detail: 'read the HF config to classify the architecture (dense vs MoE, multimodal/unified, dims, quirks)' },
+    { title: 'Ground', detail: 'read the verified KB + reference modeling files (incl. the REAL HF reference for post-cutoff archs); resolve UNVERIFIED import paths' },
     { title: 'Scaffold', detail: 'generate the full modeling_<model>.py tailored to the architecture', model: 'opus' },
-    { title: 'Review', detail: 'parallel adversarial reviewers across base-contract / sharding / converter / MoE / imports' },
+    { title: 'Review', detail: 'parallel adversarial reviewers across base-contract / sharding / converter / MoE / imports / unverified-assumptions' },
     { title: 'Finalize', detail: 'merge fixes into final code + tailored onboarding plan + eval/vLLM runbook', model: 'opus' },
     { title: 'Emit', detail: 'write modeling_<model>.py, ONBOARDING_PLAN.md, RUNBOOK.md to disk' },
-    { title: 'Verify', detail: 'download weights, inject the GENERATED file into vLLM MODEL_TYPES, compile on Neuron, and chat — proving the produced code actually runs', model: 'opus' },
-    { title: 'Repair', detail: 'on failure, read the INSTALLED package source + the real traceback, patch the generated file, and re-verify (loop)', model: 'opus' },
+    { title: 'Golden', detail: 'build an isolated CPU reference (transformers build that KNOWS this arch) and capture golden next-token id + top-k logits for a fixed prompt', model: 'opus' },
+    { title: 'Verify', detail: 'download weights, inject the GENERATED file into an engine, compile on Neuron, and check NUMERICAL CORRECTNESS vs the golden reference — three tiers: compiles / runs / numerically_correct', model: 'opus' },
+    { title: 'Repair', detail: 'on failure, read the INSTALLED package source + the real HF reference + the real traceback/divergence, patch the generated file, and re-verify (loop)', model: 'opus' },
   ],
 }
 
@@ -42,12 +43,20 @@ const CONFIG_URL = spec.config_url
 const slug = String(MODEL).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'model'
 
 // Verify-on-hardware controls. Default ON for a real (non-generic) target; the
-// Setup agent still gates on an actually-present Neuron device + vLLM venv, so
+// Setup agent still gates on an actually-present Neuron device + engine venv, so
 // this is safe to leave on. Set verify:false to force skip.
 const WANT_VERIFY = spec.verify !== false && !GENERIC
 const MAX_REPAIR_ROUNDS = Number.isInteger(spec.max_repair_rounds) ? spec.max_repair_rounds : 3
+// P0: when the caller demands real verification, a SKIPPED or NON-NUMERICALLY-CORRECT
+// verify must FAIL the whole run rather than returning a polished-but-unproven scaffold.
+const REQUIRE_VERIFY = spec.require_verify === true
+// P1: build a golden CPU reference (transformers build that knows this arch) to judge
+// NUMERICAL correctness, not just "it runs". Default ON whenever we intend to verify.
+const WANT_GOLDEN = spec.golden_ref !== false && WANT_VERIFY
+// Fixed probe prompt for golden-vs-device comparison (greedy/top-k).
+const PROBE_PROMPT = spec.probe_prompt || 'The capital of France is'
 
-log(`Onboarding target: ${MODEL}${GENERIC ? ' [generic playbook mode]' : ''}${WANT_VERIFY ? ` [verify-on-hardware, up to ${MAX_REPAIR_ROUNDS} repair rounds]` : ''}`)
+log(`Onboarding target: ${MODEL}${GENERIC ? ' [generic playbook mode]' : ''}${WANT_VERIFY ? ` [verify-on-hardware, up to ${MAX_REPAIR_ROUNDS} repair rounds${REQUIRE_VERIFY ? ', REQUIRED (fail-loud)' : ''}${WANT_GOLDEN ? ', golden-ref' : ''}]` : ''}`)
 
 // =========================================================================
 // Phase 0: Setup — resolve portable absolute paths for THIS machine.
@@ -77,6 +86,11 @@ const PATHS_SCHEMA = {
 const paths = await agent(
   `Resolve portable absolute paths AND detect the Neuron runtime for an onboarding run on THIS machine. Load tools: ToolSearch "select:Bash".
 
+CRITICAL (P0): the verify phase decides whether to run on hardware purely from the values
+you return here. Under-reporting a present device/venv silently downgrades the whole run to
+a paper exercise. So DETECT BY RUNNING COMMANDS — never infer, never report "" for something
+you did not actually probe. Run EVERY numbered command below before answering.
+
 1. Get the home dir: \`echo "$HOME"\` (Bash). Use it verbatim — do NOT hardcode /Users/... or /home/....
 2. Locate the knowledge base file "${KB_FILENAME}".
    ${spec.kb_path ? `An explicit path was provided: "${spec.kb_path}" — verify it exists with \`ls -la\`.` : `Search the likely locations in order and use the first that exists:
@@ -85,11 +99,21 @@ const paths = await agent(
      - any "${KB_FILENAME}" found via: \`find "$HOME" -maxdepth 4 -name ${KB_FILENAME} 2>/dev/null | head -5\``}
    Set kb_found=true ONLY if the chosen kb_path exists (confirm with ls). If none found, set kb_found=false and put your best-guess path in kb_path.
 3. Compute out_dir = ${spec.out_root ? `"${spec.out_root}/${slug}"` : `"$HOME/nxdi-onboarding/${slug}"`} with $HOME expanded to the real absolute path (no literal "$HOME" or "~").
-4. Detect the Neuron device: \`ls /dev/neuron0 2>/dev/null\` — set neuron_device_present true iff it exists.
-5. Find the vLLM+NxDI venv python. Try: \`ls -d /opt/aws_neuronx_venv*vllm*/bin/python 2>/dev/null\` and any "*venv*vllm*" under $HOME. Pick the first whose \`<python> -c "import vllm, neuronx_distributed_inference"\` succeeds (you MUST prepend that venv's bin dir to PATH for the import to work: \`PATH="<venv>/bin:/opt/aws/neuron/bin:$PATH" <python> -c ...\`). Set vllm_python to that python path, or "" if none works.
-6. If vllm_python found: get the installed package dir via \`PATH=... <vllm_python> -c "import neuronx_distributed_inference as m,os;print(os.path.dirname(m.__file__))"\` -> nxdi_pkg_dir. And confirm \`ls <venv>/bin/libneuronpjrt-path\` exists -> neuron_bin_dir = that venv's bin dir (this is the dir that MUST be on PATH to avoid a libneuronpjrt-path fork bomb / FileNotFoundError).
-7. notes: summarize what you found (device yes/no, venv path, any import failures).
-Return the schema with fully-expanded absolute paths. Empty string "" for anything not found — do NOT guess.`,
+4. Detect the Neuron device by ACTUALLY LISTING: \`ls -d /dev/neuron* 2>/dev/null | head\` AND \`(/opt/aws/neuron/bin/neuron-ls 2>/dev/null || neuron-ls 2>/dev/null) | head -30\`. Set neuron_device_present=true iff at least one /dev/neuron* device node exists. Paste what you saw into notes. Do NOT set false unless the \`ls\` genuinely returned nothing.
+5. Find the engine venv python. Probe ALL of these, do not stop early:
+     \`ls -d /opt/aws_neuronx_venv*vllm*/bin/python 2>/dev/null\`
+     \`ls -d /opt/aws_neuronx_venv*nxd_inference*/bin/python 2>/dev/null\`
+     \`ls -d /opt/aws_neuronx_venv*/bin/python 2>/dev/null\`
+     and any "*venv*" under $HOME.
+   For each candidate, test (PATH MUST include the venv bin so libneuronpjrt-path resolves):
+     \`PATH="<venv>/bin:/opt/aws/neuron/bin:$PATH" <python> -c "import neuronx_distributed_inference; print('nxdi ok')"\`
+     and separately \`... -c "import vllm; print('vllm', vllm.__version__)"\`.
+   Prefer the first venv where BOTH vllm AND neuronx_distributed_inference import; if none has vllm,
+   accept the first where neuronx_distributed_inference imports (it has inference_demo, a valid engine).
+   Set vllm_python to that python path. ONLY set "" if you tried every candidate above and none imported nxdi — and then say exactly which candidates you tried and the import errors in notes.
+6. If vllm_python found: get the installed package dir via \`PATH=... <vllm_python> -c "import neuronx_distributed_inference as m,os;print(os.path.dirname(m.__file__))"\` -> nxdi_pkg_dir. Confirm \`ls <venv>/bin/libneuronpjrt-path\` exists -> neuron_bin_dir = that venv's bin dir. Also check \`<vllm_python> -c "import vllm"\` and \`ls <venv>/bin/inference_demo\` so the verify phase knows which engines are available.
+7. notes: summarize EXACTLY what you found (paste the device list, the venv path(s) tried, vllm version or its absence, inference_demo presence, and any import errors verbatim).
+Return the schema with fully-expanded absolute paths. Empty string "" ONLY for things you probed and genuinely did not find.`,
   { label: 'setup:paths', phase: 'Setup', schema: PATHS_SCHEMA }
 )
 
@@ -98,6 +122,18 @@ const KB_PATH = paths.kb_path
 const OUT_DIR = paths.out_dir
 if (!paths.kb_found) log(`WARNING: KB not found at ${KB_PATH} — agents will fall back to the onboarding doc + reference code.`)
 log(`Paths resolved: KB=${KB_PATH} (${paths.kb_found ? 'found' : 'MISSING'}), out=${OUT_DIR}`)
+log(`Hardware: neuron_device=${paths.neuron_device_present}, engine_python=${paths.vllm_python || '(none)'}, nxdi_pkg=${paths.nxdi_pkg_dir || '(none)'}`)
+
+// P0 fail-loud: if the caller REQUIRES verification but Setup found no device/engine, stop
+// now with an explicit error instead of producing an unverified scaffold that reads as "done".
+const setupCanVerify = !!(paths.neuron_device_present && paths.vllm_python && paths.nxdi_pkg_dir)
+if (REQUIRE_VERIFY && WANT_VERIFY && !setupCanVerify) {
+  const why = !paths.neuron_device_present ? 'no Neuron device detected'
+    : !paths.vllm_python ? 'no engine venv (neuronx_distributed_inference) found'
+    : 'no installed NxDI package dir'
+  log(`ABORT (require_verify): ${why}. Setup notes: ${paths.notes || ''}`)
+  return { error: 'require_verify: hardware verification prerequisites missing', reason: why, setup_notes: paths.notes || '', paths }
+}
 
 // =========================================================================
 // Schemas
@@ -298,7 +334,7 @@ ${resolvedSummary}
 If the grounding above found a contrib_match with is_same_arch=true and a non-empty raw_url, that community implementation ALREADY RAN AND VALIDATED on Neuron — treat it as the PRIMARY blueprint: WebFetch its raw_url (ToolSearch "select:WebFetch") and follow its structure, imports, attention signature, and converter renames closely, adapting only the dims/quirks that differ for "${profile.model_name}". The generic llama/qwen3_moe reference is the fallback when no same-arch contrib match exists.
 
 Requirements for the generated file:
-1. Module docstring naming the model + a "GENERATED SCAFFOLD — review TODOs" banner.
+1. Module docstring naming the model + a "GENERATED SCAFFOLD — review TODOs" banner. In the docstring, list every arch-specific assumption you are UNSURE about as an explicit "ASSUMPTION (UNVERIFIED): ..." line — do NOT bury a guess as if it were fact. For a post-training-cutoff architecture especially, prefer reading/quoting the REAL HF reference modeling file (WebFetch its raw github URL) over guessing the math (RoPE variant, attention scaling, norm convention, embed scale, logit softcap, per-layer scalars); cite file:line for anything you do ground.
 2. Imports: use VERIFIED paths from the KB section 11 verbatim. For symbols the grounding step resolved, use the resolved import. For anything still unverified, import it but add a "# TODO(verify import)" comment on that line.
 3. ${profile.is_moe ? 'MoENeuronConfig' : 'NeuronConfig'} subclass IF the model needs extra runtime knobs (else use the base directly and say so in a comment).
 4. \`${cap(slug)}InferenceConfig(InferenceConfig)\`: get_required_attributes() listing exactly the HF attrs this arch reads (from the profile dims${profile.is_moe ? ' + MoE expert fields' : ''}); get_neuron_config_cls() returning ${profile.is_moe ? 'MoENeuronConfig' : 'NeuronConfig'}; an attribute_map or __init__ normalization for every entry in hf_name_quirks; add_derived_config() for head_dim / num_cores_per_group.
@@ -327,6 +363,9 @@ const DIMENSIONS = [
   { key: 'imports-flags', focus: 'Import correctness & config flags: imports match KB section 11 (VERIFIED ones verbatim; UNVERIFIED flagged); NO invented NeuronConfig flags (attention_dp_degree/is_chunked_prefill/cast_type); accuracy helpers from utils.accuracy, benchmark from utils.benchmark; class named Neuron<Model>ForCausalLM; concrete classes imported from fully-qualified modules.' },
 ]
 if (profile.is_moe) DIMENSIONS.push({ key: 'moe-specifics', focus: 'MoE specifics: get_neuron_config_cls returns MoENeuronConfig; self.mlp output indexed [0]; num_experts/top_k read from InferenceConfig (NOT MoENeuronConfig); router renamed to router.linear_router.weight; expert weights stacked [E,H,2I]/[E,I,H]; initialize_moe_module call shape (v1 vs v2) consistent.' })
+// P1: explicitly hunt for guessed/unverified arch math — the class of bug that compiles
+// fine but produces wrong logits. Flag anything asserted without a source citation.
+DIMENSIONS.push({ key: 'unverified-assumptions', focus: 'Numerical-correctness assumptions: find every arch-specific choice made WITHOUT a source citation — attention scaling (1/sqrt(d) vs hardcoded vs query_pre_attn_scalar), RoPE variant / partial-rotary inv_freq + denominator, RMSNorm (1+w vs raw w), embedding scale, final_logit_softcapping, per-layer learned scalars / extra norms, and any checkpoint tensor declared as register_buffer that must be an nn.Parameter to actually load. Each such choice that is not grounded in the real HF reference or installed source is a BLOCKER (it may compile but be numerically wrong). Demand a file:line citation or flag it.' })
 
 const reviews = await parallel(DIMENSIONS.map(d => () =>
   agent(
@@ -440,40 +479,113 @@ const tpDegree = spec.tp_degree || (profile.recommended_tp_degrees && profile.re
 
 let verifyResult = null
 let repairRounds = 0
+let golden = null
 
 const canVerify = WANT_VERIFY && paths.neuron_device_present && paths.vllm_python && paths.nxdi_pkg_dir
 if (WANT_VERIFY && !canVerify) {
-  log(`Verify skipped: ${!paths.neuron_device_present ? 'no Neuron device' : !paths.vllm_python ? 'no vLLM venv' : 'no installed NxDI pkg'} (${paths.notes || ''}).`)
+  log(`Verify skipped: ${!paths.neuron_device_present ? 'no Neuron device' : !paths.vllm_python ? 'no engine venv' : 'no installed NxDI pkg'} (${paths.notes || ''}).`)
 }
 
+// =========================================================================
+// Phase 7.5: Golden reference (P1) — build a CPU reference with a transformers
+// build that ACTUALLY KNOWS this architecture, so verify can judge NUMERICAL
+// correctness (not just "it runs"). Decisive for post-training-cutoff archs the
+// installed transformers can't load. Runs only when we intend to verify.
+// =========================================================================
+const GOLDEN_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  required: ['status', 'input_ids', 'next_token_id', 'top10', 'arch_facts', 'ref_dir', 'notes'],
+  properties: {
+    status: { type: 'string', enum: ['ok', 'skipped', 'failed'] },
+    input_ids: { type: 'array', items: { type: 'number' }, description: 'token ids for PROBE_PROMPT (the exact tokenization used)' },
+    next_token_id: { type: 'number', description: 'golden greedy next-token id, or -1 if not produced' },
+    top10: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'top-10 [{id, logit}] at the last position' },
+    arch_facts: { type: 'string', description: 'exact, source-quoted answers for the arch-specific math (RoPE variant, attention scaling, norm placement, embed scale, logit softcap, any per-layer scalars) read from the real HF reference modeling file' },
+    ref_dir: { type: 'string', description: 'absolute dir holding the reference venv + golden dump, or ""' },
+    notes: { type: 'string' },
+  },
+}
+
+if (WANT_GOLDEN && canVerify) {
+  phase('Golden')
+  golden = await agent(
+    `Build a GOLDEN CPU reference for "${MODEL}" so a later on-device run can be checked for NUMERICAL correctness (not just "it runs"). This host has plenty of RAM; a CPU fp32 forward of even a ~12B model is fine. Load tools: ToolSearch "select:Bash,Read,WebFetch".
+
+WHY: the installed engine venv's transformers may PREDATE this architecture (common for newly
+released models), so it cannot produce a trustworthy reference. Build an ISOLATED venv with a
+transformers build that knows the arch, and run the real model on CPU.
+
+STEPS:
+1. Make an isolated venv (do NOT touch /opt venvs): \`python3 -m venv ${OUT_DIR}/_golden/venv\` (need py>=3.10).
+2. Install CPU-only: \`${OUT_DIR}/_golden/venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu\`, then \`pip install -q "transformers>=<min-with-this-arch>"\` — if a released transformers already supports the arch use it, else \`pip install -q git+https://github.com/huggingface/transformers.git\`. Also \`accelerate safetensors sentencepiece protobuf\`. Verify the arch is known: \`python -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING; print(<model_type> in CONFIG_MAPPING)"\` must print True.
+3. Ensure weights are present locally (reuse ${OUT_DIR}/_verify/model if the verify phase will download there, or download to ${OUT_DIR}/_golden/model). For multimodal/unified configs, load the FULL model and take the text-decoder submodule.
+4. Tokenize the EXACT probe prompt ${JSON.stringify(PROBE_PROMPT)} (raw text, add_special_tokens=True). Run a CPU fp32 forward; capture: input_ids, greedy next-token argmax id + decoded token, and the top-10 (id, logit) at the last position. Save a torch dump + a human-readable summary under ${OUT_DIR}/_golden/.
+5. From the REAL HF reference modeling file (read it in the venv's site-packages, or WebFetch the github raw), QUOTE the exact arch-specific math the NxDI port must match: RoPE variant/partial-rotary, attention scaling (1/sqrt(d) vs a hardcoded value vs query_pre_attn_scalar), RMSNorm convention ((1+w) vs raw w), embedding scaling, final_logit_softcapping, and ANY per-layer learned scalars or extra norms. Put these in arch_facts with file:line.
+NOTE: this is an instruction-tuned-aware check — a raw-prompt continuation may be intentionally degenerate; what matters is the LOGIT distribution (argmax id + top-k), which is a strict parity signal.
+Return the schema with the TRUE values; status="failed" with notes if you could not build it (verify will then fall back to a coherence-only check).`,
+    { label: 'golden:cpu-ref', phase: 'Golden', schema: GOLDEN_SCHEMA, model: 'opus' }
+  )
+  if (golden) log(`Golden: ${golden.status}${golden.status === 'ok' ? ` — next_token_id=${golden.next_token_id}, top10[0]=${JSON.stringify(golden.top10 && golden.top10[0])}` : ` — ${golden.notes || ''}`}`)
+}
+const goldenOk = !!(golden && golden.status === 'ok' && Number.isFinite(golden.next_token_id) && golden.next_token_id >= 0)
+
 if (canVerify) {
+  // P0/P1: three-tier outcome. 'numerically_correct' is the ONLY full success when a
+  // golden reference exists; 'runs' (compiles+generates coherent text but unchecked/мismatched
+  // logits) and 'compiles' are partial. This stops "it didn't crash" from reading as "it's correct".
   const VERIFY_SCHEMA = {
     type: 'object', additionalProperties: false,
-    required: ['status', 'stage', 'chat_reply', 'error_summary', 'traceback_tail', 'culprit_source', 'log_path'],
+    required: ['tier', 'stage', 'device_first_token_id', 'matches_golden', 'chat_reply', 'error_summary', 'traceback_tail', 'culprit_source', 'log_path'],
     properties: {
-      status: { type: 'string', enum: ['success', 'failure'] },
-      stage: { type: 'string', enum: ['download', 'patch', 'launch', 'compile', 'load', 'startup', 'chat', 'done'], description: 'furthest stage reached' },
-      chat_reply: { type: 'string', description: 'the assistant chat reply text on success, else ""' },
-      error_summary: { type: 'string', description: 'one-line root cause if failed, else ""' },
-      traceback_tail: { type: 'string', description: 'last ~40 lines of the real traceback/error from the vLLM log if failed, else ""' },
-      culprit_source: { type: 'string', description: 'the relevant snippet from the INSTALLED package source that defines the contract being violated (with file:line), or "" — read it from nxdi_pkg_dir to ground the repair' },
-      log_path: { type: 'string', description: 'absolute path to the captured vLLM log' },
+      tier: { type: 'string', enum: ['failed', 'compiles', 'runs', 'numerically_correct'], description: 'failed=did not compile/load; compiles=built but no valid generation; runs=generates coherent text but logits unchecked or mismatched; numerically_correct=greedy next-token id matches the golden reference' },
+      stage: { type: 'string', enum: ['download', 'patch', 'launch', 'compile', 'load', 'startup', 'generate', 'chat', 'compare', 'done'], description: 'furthest stage reached' },
+      device_first_token_id: { type: 'number', description: 'greedy next-token id the DEVICE produced for the probe prompt, or -1' },
+      matches_golden: { type: 'boolean', description: 'true iff device_first_token_id == golden next_token_id (false if no golden)' },
+      chat_reply: { type: 'string', description: 'the assistant chat reply text on a chat smoke test, else ""' },
+      error_summary: { type: 'string', description: 'one-line root cause if not numerically_correct, else ""' },
+      traceback_tail: { type: 'string', description: 'last ~40 lines of the real traceback/error OR the logit divergence detail, else ""' },
+      culprit_source: { type: 'string', description: 'the relevant snippet from the INSTALLED package source AND/OR the real HF reference that defines the violated contract (with file:line), or "" — used to ground the repair' },
+      log_path: { type: 'string', description: 'absolute path to the captured engine log' },
     },
   }
 
-  const verifyPrompt = (round) => `Verify that the GENERATED NxD Inference modeling file ACTUALLY RUNS on this Neuron host via vLLM, loading the generated file itself (NOT any builtin implementation). Load tools: ToolSearch "select:Bash,Read".
+  const goldenBlock = goldenOk
+    ? `GOLDEN REFERENCE (build/compare against this — the bar for full success):
+- probe prompt: ${JSON.stringify(PROBE_PROMPT)}
+- golden input_ids: ${JSON.stringify(golden.input_ids)}
+- golden greedy next-token id: ${golden.next_token_id}
+- golden top-10 (id,logit): ${JSON.stringify(golden.top10)}
+- golden arch facts (source-quoted; the math your port MUST match): ${String(golden.arch_facts).slice(0, 1500)}
+- golden artifacts dir: ${golden.ref_dir}`
+    : `GOLDEN REFERENCE: not available (golden phase ${golden ? golden.status : 'skipped'}). You CANNOT certify numerical correctness; the best achievable tier is "runs" (coherent chat output). Be explicit that logits are unchecked.`
 
-This is round ${round + 1}. Be rigorous and report the REAL outcome — never claim success you did not observe.
+  const verifyPrompt = (round) => `Verify the GENERATED NxD Inference modeling file on this Neuron host, loading the generated file itself (NOT any builtin implementation), and CHECK NUMERICAL CORRECTNESS against the golden reference — "it didn't crash" is NOT success. Load tools: ToolSearch "select:Bash,Read".
+
+This is round ${round + 1}. Be rigorous and report the REAL outcome — never claim a tier you did not observe.
+
+OUTCOME TIERS (report the highest you actually reached):
+- failed: did not compile or load.
+- compiles: built/loaded but produced no valid generation.
+- runs: generates COHERENT text (chat smoke test) but logits are unchecked OR mismatch the golden.
+- numerically_correct: the DEVICE greedy next-token id for the probe prompt EQUALS the golden next-token id (and the top-k roughly aligns). This is the only full success when a golden reference exists.
+
+ENGINE CHOICE: prefer the engine least coupled to the installed transformers for the NUMERICAL check.
+If vLLM is available, you may use it; but if the model's arch is unknown to the installed transformers
+(vLLM front-end ModelConfig calls AutoConfig and may reject it), use the native NxDI \`inference_demo\`
+(or a direct NeuronBaseForCausalLM load) for the logit/token check, which reads config via json and
+loads weights via the converter — independent of transformers knowing the arch. Note which engine you used.
 
 INPUTS (absolute):
 - Generated model file: ${MODEL_FILE}
 - Generated task-head class: ${GEN_CLASS}
 - HF model id: ${MODEL}
-- vLLM venv python: ${paths.vllm_python}
-- vLLM venv bin dir (has libneuronpjrt-path): ${paths.neuron_bin_dir}
+- engine venv python: ${paths.vllm_python}
+- engine venv bin dir (has libneuronpjrt-path): ${paths.neuron_bin_dir}
 - Installed NxDI package dir (read its real source to ground contracts): ${paths.nxdi_pkg_dir}
 - TP degree to use: ${tpDegree}
 - Work dir: ${OUT_DIR}/_verify
+
+${goldenBlock}
 
 STEPS:
 1. Weights: ensure a local copy of ${MODEL} exists at ${OUT_DIR}/_verify/model (a dir with model.safetensors + config.json). If missing, download with: \`${paths.neuron_bin_dir}/huggingface-cli download ${MODEL} --local-dir ${OUT_DIR}/_verify/model\` (the venv bin dir holds huggingface-cli). Skip if already present.
@@ -484,50 +596,57 @@ STEPS:
    \`cd ${OUT_DIR}/_verify && PATH="${paths.neuron_bin_dir}:/opt/aws/neuron/bin:$PATH" PYTHONPATH="${OUT_DIR}/_verify:$PYTHONPATH" PYTHONUNBUFFERED=1 VLLM_NEURON_FRAMEWORK=neuronx-distributed-inference NEURON_COMPILED_ARTIFACTS=${OUT_DIR}/_verify/artifacts nohup ${paths.vllm_python} -m vllm.entrypoints.openai.api_server --model=${OUT_DIR}/_verify/model --served-model-name verifytarget --max-num-seqs=4 --max-model-len=4096 --tensor-parallel-size=${tpDegree} --no-enable-prefix-caching > ${OUT_DIR}/_verify/verify.log 2>&1 &\`
    GOTCHAS (already known — do not rediscover): NO --device flag (removed in vllm 0.16; the neuron platform plugin auto-activates). --no-enable-prefix-caching is REQUIRED (Neuron has no prefix caching; omitting it crashes pydantic config validation). The PATH MUST include the venv bin dir or you get FileNotFoundError: 'libneuronpjrt-path'.
 6. Confirm the patch took: grep the log for "PATCHED" inside an EngineCore/worker line — that proves the GENERATED class is the one being built. If you never see PATCHED, the verification is INVALID (you'd be testing a builtin) — report failure stage "patch".
-7. Poll the log (sleep in ~30-60s steps, up to ~12 min total — compilation of a small model takes a few minutes): success signal = "Application startup complete" AND \`curl -s http://localhost:8000/v1/models\` lists "verifytarget". Watch for failure signals: "values to unpack", "missing key"/"unexpected key", "KeyError", "RuntimeError", Python "Traceback".
-8. On startup success, send a chat: \`curl -s http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"verifytarget","messages":[{"role":"user","content":"What is 17 * 24? Answer with just the number."}],"max_tokens":40,"temperature":0}'\` and read choices[0].message.content. status=success only if you get a coherent reply.
-9. ALWAYS kill the server before returning: \`for p in $(pgrep -f vllm.entrypoints); do kill -9 $p; done\` and also \`pkill -9 -f libneuronpjrt-path\` (in case of stray forks); confirm none remain. Leaving it running holds the Neuron device and blocks re-verify.
-10. On FAILURE: capture the last ~40 lines of the real error from the log into traceback_tail, write a one-line error_summary, and — crucially — READ the INSTALLED package source under ${paths.nxdi_pkg_dir} that defines the violated contract (e.g. how models/model_base.py consumes each decoder layer's return tuple; what modules/attention/attention_base.py's forward returns; what the builtin models/${profile.architecture_family || 'llama'}/modeling_*.py converter does) and put the exact relevant snippet + file:line into culprit_source. This is what the Repair step needs.
-Return the schema with the TRUE observed result.`
+7. Poll the log (sleep in ~30-60s steps, up to ~12 min total — compilation takes a few minutes): startup signal = "Application startup complete" (vLLM) or the inference_demo run reaching generation. Watch for failure signals: "values to unpack", "missing key"/"unexpected key", "KeyError", "RuntimeError", "size ... must match", Python "Traceback". If it never builds, report tier="failed" (or "compiles" if it built but cannot generate).
+8. NUMERICAL CHECK (the important part). Feed the EXACT golden input_ids (not a re-tokenization) to the device model and read the greedy next-token id at the last position. Set device_first_token_id. ${goldenOk ? `Compare to the golden id ${golden.next_token_id}: set matches_golden=true iff equal, and ALSO sanity-check that the device top-k roughly aligns with the golden top-10 (small bf16-vs-fp32 reordering of near-ties is fine). If they match -> tier="numerically_correct".` : `No golden reference exists, so set matches_golden=false; the most you can certify is tier="runs".`} The simplest path is usually a tiny inference_demo / NeuronBaseForCausalLM script that returns logits for the given ids.
+9. COHERENCE smoke test (for the "runs" tier / human-readable proof): send a chat (use the chat template for instruction-tuned models). vLLM: \`curl -s http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"verifytarget","messages":[{"role":"user","content":"What is the capital of France? Answer in one short sentence."}],"max_tokens":40,"temperature":0}'\`. Put the reply in chat_reply. (Remember: an instruction-tuned model may emit degenerate text on a RAW prompt — that is expected; judge correctness by the golden token match, not by raw-prompt prose.)
+10. ALWAYS kill all engine procs before returning: \`for p in $(pgrep -f 'vllm.entrypoints|inference_demo'); do kill -9 $p; done\` and \`pkill -9 -f libneuronpjrt-path\` (stray forks); confirm none remain. Leaving them holds the Neuron device and blocks re-verify.
+11. If tier < numerically_correct: capture the last ~40 lines of the real error (or the logit/token divergence: device id vs golden id, and where the top-k diverges) into traceback_tail, write a one-line error_summary, and — crucially — READ both the INSTALLED package source under ${paths.nxdi_pkg_dir} (e.g. how models/model_base.py consumes each decoder layer's return tuple; what modules/attention/attention_base.py's forward returns; the builtin models/${profile.architecture_family || 'llama'}/modeling_*.py converter) AND, when the divergence is arch-math (RoPE/scaling/norm/scalars), the REAL HF reference modeling file, and put the exact relevant snippet + file:line into culprit_source. This is what the Repair step needs.
+Set tier to the HIGHEST you actually observed. Return the schema with the TRUE observed result.`
 
+  // Full success = numerically_correct when a golden exists; otherwise the best
+  // attainable is "runs" (coherent output, logits unchecked).
+  const isFullSuccess = (r) => r && (r.tier === 'numerically_correct' || (!goldenOk && r.tier === 'runs'))
   for (let round = 0; round <= MAX_REPAIR_ROUNDS; round++) {
     phase('Verify')
     repairRounds = round
     verifyResult = await agent(verifyPrompt(round), { label: `verify:round${round + 1}`, phase: 'Verify', schema: VERIFY_SCHEMA, model: 'opus' })
 
     if (!verifyResult) { log(`Verify round ${round + 1}: agent returned null — stopping.`); break }
-    log(`Verify round ${round + 1}: ${verifyResult.status} @ stage=${verifyResult.stage}${verifyResult.status === 'success' ? ` — reply: ${String(verifyResult.chat_reply).slice(0, 60)}` : ` — ${verifyResult.error_summary}`}`)
+    log(`Verify round ${round + 1}: tier=${verifyResult.tier} @ stage=${verifyResult.stage}${isFullSuccess(verifyResult) ? ` — device_token=${verifyResult.device_first_token_id}${goldenOk ? ' (matches golden)' : ''}, reply: ${String(verifyResult.chat_reply).slice(0, 50)}` : ` — ${verifyResult.error_summary}`}`)
 
-    if (verifyResult.status === 'success') break
-    if (round === MAX_REPAIR_ROUNDS) { log(`Reached max repair rounds (${MAX_REPAIR_ROUNDS}); leaving last error for manual review.`); break }
+    if (isFullSuccess(verifyResult)) break
+    if (round === MAX_REPAIR_ROUNDS) { log(`Reached max repair rounds (${MAX_REPAIR_ROUNDS}); best tier=${verifyResult.tier}. Leaving last error for manual review.`); break }
 
     // ---- Repair: patch the generated file on disk, grounded in real source ----
     phase('Repair')
+    const numericalDivergence = (verifyResult.tier === 'runs' || verifyResult.stage === 'compare')
     const repair = await agent(
-      `The generated NxD Inference modeling file FAILED to run on hardware. Fix the file ON DISK so it loads/compiles/runs, grounding EVERY change in the INSTALLED package source (not guesses). Load tools: ToolSearch "select:Read,Edit,Bash,WebFetch".
+      `The generated NxD Inference modeling file reached tier="${verifyResult.tier}" but NOT numerical correctness. Fix the file ON DISK, grounding EVERY change in the INSTALLED package source AND/OR the REAL HF reference (not guesses). Load tools: ToolSearch "select:Read,Edit,Bash,WebFetch".
 
 FILE TO FIX (edit in place): ${MODEL_FILE}
 INSTALLED PACKAGE SOURCE (read freely to confirm contracts): ${paths.nxdi_pkg_dir}
 Reference builtin of the same family to copy patterns from: ${paths.nxdi_pkg_dir}/models/${profile.architecture_family || 'llama'}/
 ${grounded && grounded.contrib_match && grounded.contrib_match.raw_url ? `Community contrib impl that ALREADY RAN on Neuron for this/a-similar arch (WebFetch to compare — its working code is strong evidence for the right contract): ${grounded.contrib_match.raw_url} [validation: ${grounded.contrib_match.validation}]` : ''}
+${goldenOk ? `GOLDEN ARCH FACTS (source-quoted from the real HF reference — the math the port MUST match; use these to fix numerical divergence): ${String(golden.arch_facts).slice(0, 1800)}` : ''}
 
-REAL FAILURE (round ${round + 1}):
-- stage: ${verifyResult.stage}
-- root cause: ${verifyResult.error_summary}
-- traceback tail:
+CURRENT RESULT (round ${round + 1}):
+- tier reached: ${verifyResult.tier}  | stage: ${verifyResult.stage}
+- device greedy next-token id: ${verifyResult.device_first_token_id}${goldenOk ? ` vs golden ${golden.next_token_id}` : ''}
+- root cause / divergence: ${verifyResult.error_summary}
+- traceback / divergence detail:
 ${verifyResult.traceback_tail}
-- relevant installed-source contract:
+- relevant source contract (installed and/or HF reference):
 ${verifyResult.culprit_source}
 
-COMMON CONTRACT BUGS in generated NxDI ports (verify each against the installed source before trusting):
-- Decoder layer forward must return the FULL tuple the base consumes. Read ${paths.nxdi_pkg_dir}/models/model_base.py where it does \`layer_outputs = decoder_layer(...)\` then indexes layer_outputs[0..N] — match that arity exactly (often a 5-tuple: hidden, present_kv, cos_cache, sin_cache, residual).
-- Attention forward return arity: read modules/attention/attention_base.py (its __iter__ / return) — the call site usually unpacks 4 values (hidden, present_kv, cos_cache, sin_cache). Generated code often wrongly unpacks 2.
+${numericalDivergence ? `THIS IS A NUMERICAL bug (it runs but the logits/token are wrong), NOT a crash. Do NOT chase tracebacks — diff the port's MATH against the golden arch facts. The usual culprits for "runs but wrong token", each to check against the real HF reference: attention scaling (1/sqrt(d) vs a hardcoded value vs query_pre_attn_scalar); RoPE variant (partial/proportional rotary, the exact inv_freq denominator and any zero-padding); RMSNorm convention ((1+w) vs raw w); embedding scaling (sqrt(hidden)); final_logit_softcapping; ANY per-layer learned scalar or extra norm; and — critically — whether a checkpoint tensor is declared as a register_buffer (which NxD's trace-time loader CONSTANT-FOLDS at its init value instead of loading) when it should be an nn.Parameter.` : `COMMON CONTRACT BUGS (verify each against the installed source before trusting):
+- Decoder layer forward must return the FULL tuple the base consumes (often a 5-tuple: hidden, present_kv, cos_cache, sin_cache, residual) — match model_base.py's indexing arity.
+- Attention forward return arity: read modules/attention/attention_base.py — the call site usually unpacks 4 values; generated code often wrongly unpacks 2.
 - MLP modules frequently return a TUPLE — index [0].
-- Converter/module layout MUST agree: if the MLP defines separate gate_proj/up_proj, the converter must NOT fuse them into gate_up_proj (and vice-versa). Missing/unexpected key errors point here.
-- Many converters must seed a top-level \`state_dict["rank_util.rank"] = torch.arange(0, tp_degree)\` AND per-layer \`self_attn.rank_util.rank\` — compare to the builtin family converter.
-- Imports: confirm each symbol's real module by importing it with the venv python (PATH must include ${paths.neuron_bin_dir}); drop any symbol the package does not export.
+- Converter/module layout MUST agree (separate gate/up vs fused gate_up_proj); missing/unexpected key errors point here.
+- Many converters must seed top-level \`state_dict["rank_util.rank"]\` AND per-layer \`self_attn.rank_util.rank\`.
+- Imports: confirm each symbol's real module by importing it with the venv python (PATH must include ${paths.neuron_bin_dir}); drop any symbol the package does not export.`}
 
-Make the MINIMAL set of edits that fixes the observed failure (and any identical sibling bug you can confirm from source). After editing, run \`${paths.vllm_python} -m py_compile ${MODEL_FILE}\` (with PATH including ${paths.neuron_bin_dir}) to confirm it still compiles. Report exactly what you changed and the file:line of the installed-source contract that justifies each change.`,
+REGRESSION GUARD (P2): make the MINIMAL set of edits that targets THIS divergence. Do NOT "improve" unrelated, already-working code — a previous round regressed by changing a correct softmax_scale. If you are unsure a change helps, do not make it. After editing, run \`${paths.vllm_python} -m py_compile ${MODEL_FILE}\` (PATH including ${paths.neuron_bin_dir}). Report exactly what you changed and the file:line (installed source or HF reference) that justifies each change.`,
       { label: `repair:round${round + 1}`, phase: 'Repair', schema: { type: 'object', additionalProperties: false, required: ['changes', 'justification'], properties: { changes: { type: 'array', items: { type: 'string' } }, justification: { type: 'string' } } }, model: 'opus' }
     )
     if (!repair) { log(`Repair round ${round + 1}: agent returned null — stopping.`); break }
@@ -535,7 +654,10 @@ Make the MINIMAL set of edits that fixes the observed failure (and any identical
   }
 }
 
-return {
+const finalTier = verifyResult ? verifyResult.tier : (canVerify ? 'unknown' : 'not-attempted')
+const verifyFullSuccess = !!(verifyResult && (verifyResult.tier === 'numerically_correct' || (!goldenOk && verifyResult.tier === 'runs')))
+
+const result = {
   model: profile.model_name,
   mode: GENERIC ? 'generic-reference' : 'targeted',
   is_moe: profile.is_moe,
@@ -546,15 +668,29 @@ return {
   changelog: final.changelog,
   emit_report: emit,
   open_questions: scaffold.open_questions,
+  golden: WANT_GOLDEN ? (golden ? { status: golden.status, next_token_id: golden.next_token_id, ref_dir: golden.ref_dir } : { status: 'not-run' }) : { status: 'disabled' },
   verify: canVerify ? {
     attempted: true,
-    status: verifyResult ? verifyResult.status : 'unknown',
+    tier: finalTier,                 // failed | compiles | runs | numerically_correct
+    numerically_correct: !!(verifyResult && verifyResult.tier === 'numerically_correct'),
+    matched_golden: !!(verifyResult && verifyResult.matches_golden),
+    device_first_token_id: verifyResult ? verifyResult.device_first_token_id : -1,
+    golden_available: goldenOk,
     repair_rounds_used: repairRounds,
     chat_reply: verifyResult ? verifyResult.chat_reply : '',
-    final_error: verifyResult && verifyResult.status !== 'success' ? verifyResult.error_summary : '',
+    final_error: verifyFullSuccess ? '' : (verifyResult ? verifyResult.error_summary : 'verify produced no result'),
     tp_degree: tpDegree,
-  } : { attempted: false, reason: WANT_VERIFY ? (paths.notes || 'no neuron device / vLLM venv') : 'verify disabled or generic mode' },
+  } : { attempted: false, reason: WANT_VERIFY ? (paths.notes || 'no neuron device / engine venv') : 'verify disabled or generic mode' },
 }
+
+// P0 fail-loud at the end too: if the caller REQUIRED verification, a run that did
+// not reach full success is an ERROR, not a quiet "here's your scaffold".
+if (REQUIRE_VERIFY && WANT_VERIFY && !verifyFullSuccess) {
+  result.error = `require_verify: did not reach ${goldenOk ? 'numerical correctness' : 'a running model'} (best tier=${finalTier})`
+  log(`FAIL (require_verify): best tier=${finalTier}. See verify.final_error.`)
+}
+
+return result
 
 // ----- helpers -----
 function cap(s) {
