@@ -37,16 +37,32 @@ running on a new host.
 
 These workflows reliably handle the mechanical ~80% of an onboarding (architecture
 profiling, the four-file scaffold, adversarial review, compile flags, KV-cache
-subclassing, weight conversion). For a **post-training-cutoff** architecture, the
-last mile — numerical correctness — still needs:
+subclassing, weight conversion). The last mile — *numerical* correctness on a
+**post-training-cutoff** architecture — needs a golden reference, source-grounding
+instead of guessing, and treating "compiles" as distinct from "correct".
 
-- a **golden reference**: an isolated venv with a `transformers` build that knows the
-  new architecture, run on CPU to produce reference logits / per-layer norms;
-- **source-grounding** every `TODO(verify)` against the real HF reference modeling
-  file rather than guessing;
-- distinguishing **"compiles / doesn't crash"** from **"numerically correct"** (an
-  instruction-tuned model emitting `<pad>` or degenerate text on a raw prompt can be
-  expected, not a bug — judge by logit parity against the golden reference).
+`nxdi-onboard-model.js` now bakes these in (informed by the Gemma-4 onboarding):
 
-The Gemma-4 onboarding hit all three of these; `gemma4-fix-verify.js` plus the
-contrib model README capture what that took.
+- **Golden phase** — builds an isolated CPU venv with a `transformers` build that
+  *knows* the architecture, runs the real model, and captures the golden next-token
+  id + top-k logits + source-quoted arch facts as the correctness oracle. Toggle with
+  `golden_ref:false`.
+- **Three-tier Verify** — `failed` / `compiles` / `runs` / `numerically_correct`.
+  Full success requires the device's greedy next-token id to **match the golden**, not
+  merely "it didn't crash". An instruction-tuned model emitting degenerate text on a
+  *raw* prompt is expected — correctness is judged by logit/token parity.
+- **Fail-loud** — `require_verify:true` makes the whole run return an `error` (instead of
+  a polished-but-unproven scaffold) if Setup finds no device/engine or Verify never
+  reaches full success. Setup now detects the device/venv by *running commands*, not by
+  agent self-report (the original silently skipped Verify on a machine that had 16
+  Neuron devices).
+- **Engine fallback** — the numerical check prefers the engine least coupled to the
+  installed `transformers` (native `inference_demo`) when the front-end can't parse a
+  brand-new arch, rather than assuming vLLM.
+- **Regression-guarded Repair** — numerical divergences are diffed against the golden
+  arch facts (not chased as tracebacks), and the repair agent is told to make minimal,
+  targeted edits and not "improve" already-correct code (a prior round had regressed a
+  correct `softmax_scale`).
+
+`gemma4-fix-verify.js` plus the `contrib/models/gemma-4-12B-it` README capture the
+worked example these improvements generalize from.
